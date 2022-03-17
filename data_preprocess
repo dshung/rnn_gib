@@ -1,0 +1,150 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import logging
+import RNN_missing_data.model.models as models
+import RNN_missing_data.data.data_preprocess as data_prep
+import argparse
+import torch
+import torch.nn as nn
+from sklearn.metrics import roc_auc_score
+import time
+from torch import optim
+import datetime
+import shutil
+import math
+
+import os
+import sys
+
+# Categorical variables pre-defined by database
+cols_cat = ['50802', '50804', '50806', '50808', '50809', '50810', 
+            '50811', '50813', '50816', '50817', '50820','50821', '50822', '50824', '50867', '50883', '50910', 
+            '50911', '50924','50952', '50953', '50954', '50956', '50993', '50998', '51003', '51009','51082', 
+            '51100', '51214', '51492', '51493', '51514', '51516','51498', '51491']
+            
+cols_num = np.sort(list(set(df.columns.tolist())-set(cols_cat)
+          -set(['HADM_ID', 'TIME_FROM_ADM', 'Unnamed: 0', 'Unnamed: 0.1', 'prbc_outcome'])))
+
+id_col = 'HADM_ID'
+target_col = 'prbc_outcome'
+
+# Read in dataframes for training and testing
+
+df_train 
+
+df_test
+
+df_all = pd.concat([df_train, df_test],ignore_index=True)
+df_all_init_time = dict(zip(df_all.groupby(id_col).first().index, df_all.groupby(id_col).first()['TIME_FROM_ADM']))
+df_all['hour'] = df_all.apply(lambda row: (row['TIME_FROM_ADM']-df_all_init_time[row[id_col]]), axis=1)
+df_all['hour'] = df_all['hour'].transform(int)
+
+# Functions
+def reset_nan(df, cols, idcol):
+    for col in cols:
+        col_pre = col+'_pre'
+        col_im = col+'_im'
+        df[col_pre] = df[col]
+        df[col_pre] = df.groupby(idcol, as_index=False)[col_pre].shift(periods = 1)
+        df[col_im] = df.apply(lambda x: (np.isnan(x[col])) or (x[col]==x[col_pre]), axis=1 )
+        df[col] = df.apply(lambda x: np.nan if x[col_im] else x[col], axis=1)
+        df = df.drop(col_pre, axis=1)
+    return df
+def standardize(df_col):
+    return(df_col-df_col.mean())/df_col.std()
+    
+# Columns with missing values
+cols_w_missing = df_all.isna().sum()[df_all.isna().sum()!=0].index.tolist()
+                        
+df_all = reset_nan(df_all, cols_w_missing, id_col)
+# Standardize values
+for col in cols_num:
+    df_all[col] = standardize(df_all[col])
+    
+df_all = df_all.drop(['10','11','12','13','14','15','16',
+                     '17','18','19','20','21','22','23',
+                     '24','25','26','27','28','29','30','31','32'], axis = 1)
+# Convert gender 
+df_all['SEX_ID'] = np.where((
+    df_all.SEX_ID >0),1,df_all.SEX_ID)
+df_all['SEX_ID'] = np.where((
+    df_all.SEX_ID <0),0,df_all.SEX_ID)
+
+# Make the dataset evenly spaced, Two treatments for numerical and categorical data:
+# Numerical: take the average value
+# Categorical: take the first of the hour value
+
+df_all_hrly = df_all.groupby([id_col, 'hour'], as_index=False).mean()
+df_all_hrly_first = df_all.groupby([id_col, 'hour'], as_index=False).first()
+for col in cols_cat:
+    df_all_hrly[col] = df_all_hrly_first[col]
+    
+max_time = df_all_hrly.groupby([id_col])['hour'].max().reset_index()
+max_time.rename(columns={'hour':'max_time'}, inplace=True)
+max_time['min_time']=0
+max_time['time_list']= max_time.apply(lambda row: np.arange(row['min_time'], row['max_time']+1), axis=1)
+max_time = max_time.join(df_all_hrly.groupby(id_col)['hour'].unique(), on=id_col)
+max_time['time_missing'] = max_time.apply(lambda row: list(set(row['time_list'])-set(row['hour'])), axis=1)
+
+_=max_time.apply(lambda row: row['time_missing'].sort(), axis=1)
+df_other = pd.DataFrame(max_time.time_missing.tolist(), 
+                        index = max_time[id_col]).stack().reset_index(name='hour')[[id_col,'hour']]
+                        
+df_all_hrly = pd.concat([df_all_hrly,df_other], ignore_index=True, sort=False)
+df_all_hrly.sort_values(by=[id_col, 'hour'], inplace=True)
+for col in cols_im:
+    print(col[:-3],': ', df_all_hrly[col].sum()/df_all_hrly.shape[0])
+    
+# Target column with ceiling function
+df_all_hrly[target_col] = df_all_hrly[target_col].transform(np.ceil)
+# Fill in the target missing values with 0
+df_all_hrly[target_col] = df_all_hrly[target_col].fillna(0)
+
+# Handle missing indicators by setting to 1
+for col in cols_im:
+    df_all_hrly[col] = df_all_hrly[col].transform(np.floor)
+df_all_hrly[cols_im]=df_all_hrly[cols_im].fillna(1)
+df_all_hrly[cols_im]=df_all_hrly[cols_im].astype(int)
+
+# Standardization of Age
+ages = dict(zip( df_all_hrly.groupby(id_col).first().index,
+                 df_all_hrly.groupby(id_col).first()['AGE_AT_ADM']))
+ages_array= list(ages.values())
+abnormal_age=[age for age in ages_array if age>150] 
+ages_array = [np.nan if age>150 else age for age in ages_array]
+ages_array = (ages_array-np.nanmean(ages_array))/np.nanstd(ages_array)
+ages = dict(zip(df_all_hrly.groupby(id_col).first().index,ages_array))
+df_all_hrly['AGE_AT_ADM']=df_all_hrly.apply(lambda row: ages[row[id_col]], axis=1)
+df_all_hrly['AGE_AT_ADM'] = df_all_hrly['AGE_AT_ADM'].fillna(0)
+
+# Forward fill imputation for missing values
+df_all_hrly[cols_cat] = df_all_hrly.groupby(id_col)[cols_cat].fillna(method='ffill')
+df_all_hrly[cols_cat] = df_all_hrly[cols_cat].astype(int)
+df_all_hrly['SEX_ID'] = df_all_hrly.groupby(id_col)['SEX_ID'].fillna(method='ffill')
+
+# Get the first 24-hr data, and make the target shifted by -1hr, so at each time to predict the outcome in the next hour
+df_24hr = df_all_hrly.loc[df_all_hrly['hour']<=24]
+df_24hr = df_24hr.drop(['Unnamed: 0','INDEX','TIME_FROM_ADM'], axis=1)
+df_24hr[target_col] = df_24hr.groupby(id_col)[target_col].shift(-1)
+
+# Sanity check if the last outcome in a sequence is nan
+df_lasthr = df_24hr.groupby(id_col).last()['hour'].reset_index()
+df_lasthr = df_lasthr.merge(df_24hr, on=[id_col,'hour'], how='left')
+df_lasthr[target_col].notna().any() # False indicates that none of the last hr target is not an nan.
+
+# Different imputation strategies
+df_24hr_train = df_24hr.loc[~df_24hr[id_col].isin(test_IDs)]
+df_24hr_test = df_24hr.loc[df_24hr[id_col].isin(test_IDs)]
+# type 1 fillna with zeros
+input_1 = df_24hr_train.fillna(0)[[id_col,target_col]+cols_feat_basic]
+# type 2 fillna with fill forward
+input_2 = df_24hr_train.fillna(method='ffill')[[id_col,target_col]+cols_feat_basic]
+    # then you need to fill in the missing with 0, because for some visits some features were never measured
+input_2 = input_2.fillna(0)
+# type 3 fillna with zeros and with missing indicator
+input_3 = df_24hr_train.fillna(0)[[id_col,target_col]+cols_feat_basic+cols_im]
+# type 4 fillna with zeros and with missing indicator
+input_4 = df_24hr_train.fillna(method='ffill')[[id_col,target_col]+cols_feat_basic+cols_im]
+input_4 = input_4.fillna(0)
